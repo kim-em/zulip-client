@@ -48,7 +48,7 @@ def export_topic_to_json(
                 "sender": m["sender_name"],
                 "sender_email": m["sender_email"],
                 "timestamp": datetime.fromtimestamp(m["timestamp"]).isoformat(),
-                "content": m["content"],
+                "content": m.get("content_markdown") or m["content"],
                 "content_text": m["content_text"],
             }
             for m in messages
@@ -102,7 +102,9 @@ def export_topic_to_markdown(
         lines.append(f"## {'[UNREAD] ' if is_unread else ''}{msg['sender_name']}")
         lines.append(f"*{date_str}*")
         lines.append("")
-        lines.append(msg["content_text"])
+        # Prefer markdown content, fall back to stripped HTML for old messages
+        content = msg.get("content_markdown") or msg["content_text"]
+        lines.append(content)
         lines.append("")
         lines.append("---")
         lines.append("")
