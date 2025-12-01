@@ -6,21 +6,20 @@ Local Zulip message sync and unread management CLI tool.
 
 - **Unread Summary**: View unread message counts by stream and topic
 - **Sync**: Download full thread content for topics with unread messages
+- **Browse Local Data**: List channels, topics, and read messages offline
 - **Export**: Export stored messages to JSON or Markdown
 - **Multi-site**: Support for multiple Zulip instances (leanprover, lean-fro)
 - **Incremental**: Only fetches new messages on subsequent syncs
+- **Rate Limiting**: Automatic retry with exponential backoff on API limits
 
 ## Installation
 
 ```bash
 # No dependencies required - uses only Python standard library
-pip install -e .
+pipx install -e .
 ```
 
-Or run directly without installing:
-```bash
-python -m zulip_client <command>
-```
+This installs the `zulip-client` command globally.
 
 ## Configuration
 
@@ -50,13 +49,13 @@ Uses existing Zulip credentials from `~/metacortex/.credentials/zulip.json`:
 
 ```bash
 # Default site
-python -m zulip_client unread
+zulip-client unread
 
 # Specific site
-python -m zulip_client unread --site lean-fro
+zulip-client unread --site lean-fro
 
 # All sites
-python -m zulip_client unread --all
+zulip-client unread --all
 ```
 
 Output:
@@ -76,35 +75,112 @@ https://leanprover.zulipchat.com - 47 unread messages
 
 ```bash
 # Sync topics with unread messages
-python -m zulip_client sync
+zulip-client sync
 
 # Verbose output
-python -m zulip_client sync --verbose
+zulip-client sync --verbose
+
+# Limit to first N topics
+zulip-client sync --limit 10
 
 # Sync all sites
-python -m zulip_client sync --all
+zulip-client sync --all
+```
+
+### Sync your participated topics
+
+Download all topics where you've posted at least one message:
+
+```bash
+# Sync all topics you've participated in
+zulip-client sync-mine
+
+# Limit to N new topics (incremental - re-run to get more)
+zulip-client sync-mine --limit 100
+
+# Verbose output
+zulip-client sync-mine --verbose
+```
+
+The `--limit` flag only counts topics not already synced locally, so running
+`sync-mine --limit 100` multiple times will eventually sync everything.
+
+### Triage threads by AI-classified importance
+
+Use Claude to generate summaries and classify threads by importance/urgency:
+
+```bash
+# Show triage view of unread threads (uses existing summaries)
+zulip-client triage
+
+# Generate summaries for threads that don't have them
+zulip-client triage --generate-missing
+
+# Limit summary generation (useful for quota management)
+zulip-client triage --generate-missing --limit 10
+
+# Filter by minimum importance or urgency
+zulip-client triage --importance high
+zulip-client triage --urgency medium
+
+# Include all threads, not just unread
+zulip-client triage --all
+```
+
+Output groups threads by importance:
+```
+Triage: 15 unread threads (12 summarized)
+======================================================================
+
+🔴 HIGH IMPORTANCE + URGENT
+#lean4 > RFC: breaking change to simp [3 unread]
+  Proposal to change simp behavior that affects downstream projects...
+
+🟠 HIGH IMPORTANCE
+#mathlib4 > maintainer review needed [5 unread]
+  PR requires maintainer approval before merge...
+
+🟡 MEDIUM IMPORTANCE
+#general > meetup planning [2 unread]
+  Discussing dates for the next community meetup...
+
+⚪ NOT YET SUMMARIZED
+#lean4 > question about tactics [1 unread]
 ```
 
 ### Export stored messages
 
 ```bash
 # Export all stored messages to JSON
-python -m zulip_client export
+zulip-client export
 
 # Export specific stream
-python -m zulip_client export --stream "lean4"
+zulip-client export --stream "lean4"
 
 # Export specific topic
-python -m zulip_client export --stream "lean4" --topic "grind tactic"
+zulip-client export --stream "lean4" --topic "grind tactic"
 
 # Export to Markdown
-python -m zulip_client export --format markdown
+zulip-client export --format markdown
+```
+
+### Browse downloaded data
+
+```bash
+# List all downloaded channels with topic/message counts
+zulip-client channels
+
+# List topics in a channel
+zulip-client topics "lean4"
+
+# Show all messages in a topic (with read/unread status)
+zulip-client messages "lean4" "grind tactic"
 ```
 
 ### List configured sites
 
 ```bash
-python -m zulip_client sites
+zulip-client sites
 ```
 
 ## Data Storage
@@ -117,10 +193,9 @@ Both directories are gitignored.
 ## Development
 
 ```bash
-# Run directly
-python -m zulip_client <command>
+# Install in editable mode (changes take effect immediately)
+pipx install -e .
 
-# Or install in editable mode
-pip install -e .
-zulip-client <command>
+# Reinstall after changes to pyproject.toml
+pipx reinstall zulip-client
 ```

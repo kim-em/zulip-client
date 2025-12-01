@@ -1,0 +1,24 @@
+{
+  "summary": "Discussion about the IMO Grand Challenge design from 2019, focusing on the formal-to-formal variant using Lean and concerns about phrasing around 'eliminating human judges'. Daniel Selsam clarified that the competition would build on mathlib without blacklisting, and that solutions need to type-check within 10 minutes. Later in 2021, questions arose about Lean 3 vs Lean 4 for the challenge, with confirmation that mathlib is essential for IMO formalization but Lean 4 was still a work in progress.",
+  "importance": "low",
+  "urgency": "low",
+  "key_points": [
+    "Concern raised about 'eliminating human judges' phrasing being potentially threatening to mathematicians",
+    "Daniel Selsam clarified that solutions would use mathlib without blacklisting specific theorems",
+    "Background math library would include theorems human competitors can cite plus basic definitions, type-checked separately from the 10-minute limit",
+    "Mathlib is highly relevant for IMO problems (see archive/ directory for examples)",
+    "As of 2021, Lean 4 was still work in progress and mathlib porting wasn't ready for general contribution"
+  ],
+  "action_items": [],
+  "participants": [
+    {"name": "Daniel Selsam", "count": 6},
+    {"name": "Johan Commelin", "count": 3},
+    {"name": "Kim Morrison", "count": 4},
+    {"name": "Jason Rute", "count": 3},
+    {"name": "Patrick Massot", "count": 1},
+    {"name": "Mario Carneiro", "count": 1},
+    {"name": "Floris van Doorn", "count": 1},
+    {"name": "LBMJ", "count": 2},
+    {"name": "Kevin Buzzard", "count": 2}
+  ]
+}
