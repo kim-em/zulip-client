@@ -743,7 +743,7 @@ def _summary_single(
     print()
 
     try:
-        result = generate_summary(messages, model=model)
+        result = generate_summary(messages, model=model or DEFAULT_MODEL)
     except Exception as e:
         print(f"Error generating summary: {e}", file=sys.stderr)
         if existing:
@@ -846,9 +846,10 @@ def _generate_batch(
     """Generate summaries for a batch of topics with quota checking."""
     import json as json_module
 
-    # If --model is explicitly specified, use it directly without quota check
+    # If --model is explicitly specified by user, skip quota check
+    # (We detect this by checking if it was passed on command line vs using default)
     explicit_model = getattr(args, 'model', None)
-    skip_quota_check = explicit_model and explicit_model != DEFAULT_MODEL
+    skip_quota_check = explicit_model is not None
 
     print(f"Processing {len(to_process)} topics...")
     print()
@@ -913,7 +914,6 @@ def cmd_triage(args: argparse.Namespace) -> None:
     from datetime import datetime
 
     site_name = args.site or get_default_site()
-    model = args.model
     unread_only = not args.all
 
     site_id = get_site_id(site_name)
@@ -940,8 +940,8 @@ def cmd_triage(args: argparse.Namespace) -> None:
         if args.limit:
             missing = missing[:args.limit]
 
-        # If --model is explicitly specified, use it directly without quota check
-        explicit_model = args.model if args.model != DEFAULT_MODEL else None
+        # If --model is explicitly specified by user, skip quota check
+        explicit_model = args.model
 
         if missing:
             print(f"Generating summaries for {len(missing)} threads...")
@@ -1234,7 +1234,7 @@ def main() -> NoReturn:
     summary_parser.add_argument("topic", nargs="?", help="Topic name (if omitted, process all topics in channel)")
     summary_parser.add_argument("-s", "--site", help="Zulip site")
     summary_parser.add_argument("-f", "--force", action="store_true", help="Regenerate even if already summarized")
-    summary_parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Claude model for single topic (default: {DEFAULT_MODEL})")
+    summary_parser.add_argument("--model", help=f"Claude model (default: {DEFAULT_MODEL}). If specified, skips quota checking.")
     summary_parser.set_defaults(func=cmd_summary)
 
     # triage command
@@ -1244,7 +1244,7 @@ def main() -> NoReturn:
     triage_parser.add_argument("--importance", choices=["high", "medium", "low"], help="Filter by minimum importance")
     triage_parser.add_argument("--urgency", choices=["high", "medium", "low"], help="Filter by minimum urgency")
     triage_parser.add_argument("--generate-missing", action="store_true", help="Generate summaries for threads without them")
-    triage_parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Claude model (default: {DEFAULT_MODEL})")
+    triage_parser.add_argument("--model", help=f"Claude model (default: {DEFAULT_MODEL}). If specified, skips quota checking.")
     triage_parser.add_argument("-n", "--limit", type=int, help="Limit number of summaries to generate")
     triage_parser.set_defaults(func=cmd_triage)
 
