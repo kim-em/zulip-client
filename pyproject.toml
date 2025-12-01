@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zulip-client"
+version = "1.0.0"
+description = "Local Zulip message sync and unread management"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Kim Morrison"}
+]
+
+[project.scripts]
+zulip-client = "zulip_client.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

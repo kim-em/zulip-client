@@ -266,7 +266,7 @@ Each JSON file contains:
 
 ## Implementation Status
 
-- [x] Initialize project structure (package.json, tsconfig.json)
+- [x] Initialize project structure (pyproject.toml)
 - [x] Create credentials reader
 - [x] Create Zulip API client with auth
 - [x] Set up SQLite database and schema
@@ -274,8 +274,8 @@ Each JSON file contains:
 - [x] Implement sync command
 - [x] Implement export command
 - [x] Add README with usage examples
-- [ ] Test with npm install and build
-- [ ] Create GitHub repo
+- [x] Rewrite in Python (no external dependencies)
+- [x] Test and push to GitHub
 
 ## Notes
 

@@ -13,8 +13,13 @@ Local Zulip message sync and unread management CLI tool.
 ## Installation
 
 ```bash
-npm install
-npm run build
+# No dependencies required - uses only Python standard library
+pip install -e .
+```
+
+Or run directly without installing:
+```bash
+python -m zulip_client <command>
 ```
 
 ## Configuration
@@ -45,13 +50,13 @@ Uses existing Zulip credentials from `~/metacortex/.credentials/zulip.json`:
 
 ```bash
 # Default site
-npm run dev -- unread
+python -m zulip_client unread
 
 # Specific site
-npm run dev -- unread --site lean-fro
+python -m zulip_client unread --site lean-fro
 
 # All sites
-npm run dev -- unread --all
+python -m zulip_client unread --all
 ```
 
 Output:
@@ -71,35 +76,35 @@ https://leanprover.zulipchat.com - 47 unread messages
 
 ```bash
 # Sync topics with unread messages
-npm run dev -- sync
+python -m zulip_client sync
 
 # Verbose output
-npm run dev -- sync --verbose
+python -m zulip_client sync --verbose
 
 # Sync all sites
-npm run dev -- sync --all
+python -m zulip_client sync --all
 ```
 
 ### Export stored messages
 
 ```bash
 # Export all stored messages to JSON
-npm run dev -- export
+python -m zulip_client export
 
 # Export specific stream
-npm run dev -- export --stream "lean4"
+python -m zulip_client export --stream "lean4"
 
 # Export specific topic
-npm run dev -- export --stream "lean4" --topic "grind tactic"
+python -m zulip_client export --stream "lean4" --topic "grind tactic"
 
 # Export to Markdown
-npm run dev -- export --format markdown
+python -m zulip_client export --format markdown
 ```
 
 ### List configured sites
 
 ```bash
-npm run dev -- sites
+python -m zulip_client sites
 ```
 
 ## Data Storage
@@ -112,12 +117,10 @@ Both directories are gitignored.
 ## Development
 
 ```bash
-# Run in development mode
-npm run dev -- <command>
+# Run directly
+python -m zulip_client <command>
 
-# Build for production
-npm run build
-
-# Run built version
-npm start -- <command>
+# Or install in editable mode
+pip install -e .
+zulip-client <command>
 ```
