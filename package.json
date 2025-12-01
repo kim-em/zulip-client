@@ -1,0 +1,28 @@
+{
+  "name": "zulip-client",
+  "version": "1.0.0",
+  "description": "Local Zulip message sync and unread management",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "zulip-client": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "author": "Kim Morrison",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.6.0",
+    "commander": "^12.1.0",
+    "html-to-text": "^9.0.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.10.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
