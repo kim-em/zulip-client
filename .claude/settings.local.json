@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python3 -c \"\nfrom zulip_client.credentials import get_site_credentials\nimport json\nimport base64\nfrom urllib.request import Request, urlopen\nfrom urllib.parse import urlencode\n\ncreds = get_site_credentials(''leanprover'')\nauth_string = f\"\"{creds[''email'']}:{creds[''api_key'']}\"\"\nencoded = base64.b64encode(auth_string.encode()).decode()\n\n# Search for messages sent by the current user\nurl = f\"\"{creds[''site'']}/api/v1/messages\"\"\nheaders = {''Authorization'': f''Basic {encoded}''}\n\nparams = {\n    ''narrow'': json.dumps([{''operator'': ''sender'', ''operand'': creds[''email'']}]),\n    ''anchor'': ''newest'',\n    ''num_before'': ''100'',\n    ''num_after'': ''0'',\n}\n\nurl_with_params = f\"\"{url}?{urlencode(params)}\"\"\nrequest = Request(url_with_params, headers=headers, method=''GET'')\n\nwith urlopen(request) as response:\n    result = json.loads(response.read().decode())\n\nmessages = result.get(''messages'', [])\nprint(f''Found {len(messages)} recent messages from you'')\nprint()\n\n# Get unique stream/topic pairs\ntopics = set()\nfor m in messages:\n    if m.get(''type'') == ''stream'':\n        topics.add((m[''display_recipient''], m[''subject'']))\n\nprint(f''Unique topics: {len(topics)}'')\nfor stream, topic in list(topics)[:10]:\n    print(f''  #{stream} > {topic}'')\n\")"
-    ],
-    "deny": [],
-    "ask": []
-  }
-}
