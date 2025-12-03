@@ -1,0 +1,17 @@
+[project]
+name = "zulip-client-mcp"
+version = "1.0.0"
+description = "MCP server for Zulip search - Claude Code integration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "zulip-client",
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+zulip-mcp = "zulip_client_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

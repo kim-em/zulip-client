@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS sync_mine_state (
   oldest_scanned_message_id INTEGER NOT NULL
 );
 
+-- Track sync-all progress (high water mark for incremental sync)
+CREATE TABLE IF NOT EXISTS sync_all_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id INTEGER UNIQUE NOT NULL REFERENCES sites(id),
+  last_synced_message_id INTEGER NOT NULL,
+  message_count INTEGER NOT NULL
+);
+
 -- AI-generated summaries
 CREATE TABLE IF NOT EXISTS summaries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +138,53 @@ def get_database() -> sqlite3.Connection:
         _db.execute("ALTER TABLE messages ADD COLUMN content_markdown TEXT")
         _db.commit()
 
+    # Migration: create FTS5 table if missing
+    _migrate_fts(_db)
+
     return _db
+
+
+def _migrate_fts(db: sqlite3.Connection) -> None:
+    """Create FTS5 tables and populate from existing data if needed."""
+    # Messages FTS
+    cursor = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+    )
+    if cursor.fetchone() is None:
+        db.execute("""
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content_text,
+                sender_name,
+                content='messages',
+                content_rowid='id'
+            )
+        """)
+        db.execute("""
+            INSERT INTO messages_fts(rowid, content_text, sender_name)
+            SELECT id, content_text, sender_name FROM messages
+        """)
+        db.commit()
+
+    # Summaries FTS
+    cursor = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='summaries_fts'"
+    )
+    if cursor.fetchone() is None:
+        db.execute("""
+            CREATE VIRTUAL TABLE summaries_fts USING fts5(
+                summary_text,
+                key_points,
+                action_items,
+                content='summaries',
+                content_rowid='id'
+            )
+        """)
+        db.execute("""
+            INSERT INTO summaries_fts(rowid, summary_text, key_points, action_items)
+            SELECT id, summary_text, COALESCE(key_points, ''), COALESCE(action_items, '')
+            FROM summaries
+        """)
+        db.commit()
 
 
 def close_database() -> None:
@@ -245,8 +299,9 @@ def insert_messages(topic_id: int, messages: List[Dict[str, Any]]) -> int:
         # For markdown content, content_text is just the content itself
         # (no HTML to strip since we request markdown)
         content_text = content
+        sender_name = msg["sender_full_name"]
         try:
-            db.execute(
+            cursor = db.execute(
                 """
                 INSERT OR IGNORE INTO messages
                 (topic_id, message_id, sender_name, sender_email, content, content_text, content_markdown, timestamp, raw_json)
@@ -255,7 +310,7 @@ def insert_messages(topic_id: int, messages: List[Dict[str, Any]]) -> int:
                 (
                     topic_id,
                     msg["id"],
-                    msg["sender_full_name"],
+                    sender_name,
                     msg["sender_email"],
                     content,
                     content_text,
@@ -264,7 +319,15 @@ def insert_messages(topic_id: int, messages: List[Dict[str, Any]]) -> int:
                     str(msg),
                 ),
             )
-            if db.total_changes > 0:
+            if cursor.rowcount > 0:
+                # Also insert into FTS index
+                db.execute(
+                    """
+                    INSERT INTO messages_fts(rowid, content_text, sender_name)
+                    VALUES (?, ?, ?)
+                    """,
+                    (cursor.lastrowid, content_text, sender_name),
+                )
                 inserted += 1
         except sqlite3.IntegrityError:
             pass  # Already exists
@@ -279,6 +342,17 @@ def clear_unread_messages(site_id: int) -> None:
     db = get_database()
     db.execute("DELETE FROM unread_messages WHERE site_id = ?", (site_id,))
     db.commit()
+
+
+def mark_topic_as_read(site_id: int, stream_name: str, topic_name: str) -> int:
+    """Mark all messages in a topic as read. Returns number of messages marked."""
+    db = get_database()
+    cursor = db.execute(
+        "DELETE FROM unread_messages WHERE site_id = ? AND stream_name = ? AND topic_name = ?",
+        (site_id, stream_name, topic_name),
+    )
+    db.commit()
+    return cursor.rowcount
 
 
 def insert_unread_messages(
@@ -578,6 +652,94 @@ def update_sync_mine_state(site_id: int, oldest_message_id: int) -> None:
     db.commit()
 
 
+# Sync-all state operations
+def get_sync_all_state(site_id: int) -> Optional[Dict[str, int]]:
+    """Get the sync-all state for a site (high water mark and message count)."""
+    db = get_database()
+    cursor = db.execute(
+        "SELECT last_synced_message_id, message_count FROM sync_all_state WHERE site_id = ?",
+        (site_id,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return {
+            "last_synced_message_id": row["last_synced_message_id"],
+            "message_count": row["message_count"],
+        }
+    return None
+
+
+def update_sync_all_state(site_id: int, last_synced_message_id: int, message_count: int) -> None:
+    """Update the sync-all state for a site."""
+    db = get_database()
+    db.execute(
+        """
+        INSERT INTO sync_all_state (site_id, last_synced_message_id, message_count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(site_id) DO UPDATE SET
+            last_synced_message_id = excluded.last_synced_message_id,
+            message_count = excluded.message_count
+        """,
+        (site_id, last_synced_message_id, message_count),
+    )
+    db.commit()
+
+
+def get_message_count_for_site(site_id: int, up_to_message_id: Optional[int] = None) -> int:
+    """Get total message count for a site, optionally up to a specific message ID."""
+    db = get_database()
+    if up_to_message_id is not None:
+        cursor = db.execute(
+            """
+            SELECT COUNT(*) as count
+            FROM messages m
+            JOIN topics t ON m.topic_id = t.id
+            JOIN streams s ON t.stream_id = s.id
+            WHERE s.site_id = ? AND m.message_id <= ?
+            """,
+            (site_id, up_to_message_id),
+        )
+    else:
+        cursor = db.execute(
+            """
+            SELECT COUNT(*) as count
+            FROM messages m
+            JOIN topics t ON m.topic_id = t.id
+            JOIN streams s ON t.stream_id = s.id
+            WHERE s.site_id = ?
+            """,
+            (site_id,),
+        )
+    return cursor.fetchone()["count"]
+
+
+def validate_sync_all_state(site_id: int) -> bool:
+    """Validate that sync-all state is consistent with actual message count."""
+    state = get_sync_all_state(site_id)
+    if not state:
+        return False
+
+    actual_count = get_message_count_for_site(site_id, state["last_synced_message_id"])
+    return actual_count == state["message_count"]
+
+
+def get_max_message_id_for_site(site_id: int) -> Optional[int]:
+    """Get the highest message ID stored for a site."""
+    db = get_database()
+    cursor = db.execute(
+        """
+        SELECT MAX(m.message_id) as max_id
+        FROM messages m
+        JOIN topics t ON m.topic_id = t.id
+        JOIN streams s ON t.stream_id = s.id
+        WHERE s.site_id = ?
+        """,
+        (site_id,),
+    )
+    row = cursor.fetchone()
+    return row["max_id"] if row and row["max_id"] else None
+
+
 # Summary operations
 def get_topic_by_names(
     site_id: int, stream_name: str, topic_name: str
@@ -617,7 +779,12 @@ def save_summary(
 ) -> None:
     """Save or update a summary."""
     db = get_database()
-    db.execute(
+
+    # Check if summary already exists (for FTS update)
+    cursor = db.execute("SELECT id FROM summaries WHERE topic_id = ?", (topic_id,))
+    existing = cursor.fetchone()
+
+    cursor = db.execute(
         """
         INSERT INTO summaries
         (topic_id, summary_text, importance, urgency, last_message_id, key_points, action_items, participants, created_at)
@@ -644,6 +811,28 @@ def save_summary(
             datetime.now().isoformat(),
         ),
     )
+
+    # Update FTS index
+    if existing:
+        # Delete old FTS entry and insert new one
+        db.execute(
+            """
+            INSERT INTO summaries_fts(summaries_fts, rowid, summary_text, key_points, action_items)
+            VALUES ('delete', ?, ?, ?, ?)
+            """,
+            (existing["id"], summary_text, key_points or "", action_items or ""),
+        )
+    # Get the summary id (either new or existing)
+    cursor = db.execute("SELECT id FROM summaries WHERE topic_id = ?", (topic_id,))
+    summary_id = cursor.fetchone()["id"]
+    db.execute(
+        """
+        INSERT INTO summaries_fts(rowid, summary_text, key_points, action_items)
+        VALUES (?, ?, ?, ?)
+        """,
+        (summary_id, summary_text, key_points or "", action_items or ""),
+    )
+
     db.commit()
 
 
@@ -675,6 +864,8 @@ def get_topics_for_triage(
         cursor = db.execute(
             """
             SELECT DISTINCT
+                site.url as site_url,
+                s.stream_id as stream_id,
                 s.name as stream_name,
                 t.name as topic_name,
                 t.id as topic_id,
@@ -690,11 +881,12 @@ def get_topics_for_triage(
                 COUNT(u.id) as unread_count
             FROM unread_messages u
             JOIN streams s ON u.stream_name = s.name AND s.site_id = ?
+            JOIN sites site ON site.id = s.site_id
             JOIN topics t ON t.stream_id = s.id AND t.name = u.topic_name
             LEFT JOIN summaries sum ON sum.topic_id = t.id
             WHERE u.site_id = ?
             GROUP BY t.id
-            ORDER BY sum.importance DESC, sum.urgency DESC, unread_count DESC
+            ORDER BY sum.importance DESC, sum.urgency DESC, t.last_message_id DESC
             """,
             (site_id, site_id),
         )
@@ -702,6 +894,8 @@ def get_topics_for_triage(
         cursor = db.execute(
             """
             SELECT
+                site.url as site_url,
+                s.stream_id as stream_id,
                 s.name as stream_name,
                 t.name as topic_name,
                 t.id as topic_id,
@@ -718,11 +912,243 @@ def get_topics_for_triage(
                  WHERE u.site_id = ? AND u.stream_name = s.name AND u.topic_name = t.name) as unread_count
             FROM topics t
             JOIN streams s ON t.stream_id = s.id
+            JOIN sites site ON site.id = s.site_id
             LEFT JOIN summaries sum ON sum.topic_id = t.id
             WHERE s.site_id = ?
-            ORDER BY sum.importance DESC, sum.urgency DESC
+            ORDER BY sum.importance DESC, sum.urgency DESC, t.last_message_id DESC
             """,
             (site_id, site_id),
         )
 
     return [dict(row) for row in cursor]
+
+
+# Full-text search operations
+def search_threads(
+    query: str,
+    site_id: Optional[int] = None,
+    stream_name: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """
+    Full-text search returning complete threads.
+
+    Searches both message content AND AI-generated summaries.
+
+    Args:
+        query: FTS5 query string (supports AND, OR, NOT, phrases, prefix*)
+        site_id: Optional filter by site
+        stream_name: Optional filter by stream
+        limit: Max number of threads to return
+
+    Returns:
+        List of thread dicts, each containing:
+        - site_name, site_url, stream_name, stream_id, topic_name
+        - url (Zulip link)
+        - messages (all messages in thread, ordered by timestamp)
+        - matched_message_ids (which messages hit the query)
+        - matched_in_summary (True if summary matched)
+        - summary/importance/urgency (if available)
+    """
+    from urllib.parse import quote
+
+    db = get_database()
+
+    # Build the WHERE clause for filters
+    where_parts = []
+    params: List[Any] = []
+
+    if site_id is not None:
+        where_parts.append("s.site_id = ?")
+        params.append(site_id)
+
+    if stream_name is not None:
+        where_parts.append("s.name = ?")
+        params.append(stream_name)
+
+    where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+
+    # Search both messages and summaries, union the results
+    matching_query = f"""
+        WITH
+        -- Messages matching the query
+        msg_fts_matches AS (
+            SELECT rowid as message_db_id
+            FROM messages_fts
+            WHERE messages_fts MATCH ?
+        ),
+        msg_matching AS (
+            SELECT
+                m.id as message_id,
+                m.topic_id,
+                0 as from_summary
+            FROM msg_fts_matches fm
+            JOIN messages m ON m.id = fm.message_db_id
+            JOIN topics t ON t.id = m.topic_id
+            JOIN streams s ON s.id = t.stream_id
+            WHERE {where_clause}
+        ),
+        -- Summaries matching the query
+        sum_fts_matches AS (
+            SELECT rowid as summary_db_id
+            FROM summaries_fts
+            WHERE summaries_fts MATCH ?
+        ),
+        sum_matching AS (
+            SELECT
+                NULL as message_id,
+                sum.topic_id,
+                1 as from_summary
+            FROM sum_fts_matches sfm
+            JOIN summaries sum ON sum.id = sfm.summary_db_id
+            JOIN topics t ON t.id = sum.topic_id
+            JOIN streams s ON s.id = t.stream_id
+            WHERE {where_clause}
+        ),
+        -- Combined matches
+        all_matches AS (
+            SELECT message_id, topic_id, from_summary FROM msg_matching
+            UNION ALL
+            SELECT message_id, topic_id, from_summary FROM sum_matching
+        ),
+        -- Aggregate by topic
+        matching_topics AS (
+            SELECT
+                topic_id,
+                COUNT(CASE WHEN message_id IS NOT NULL THEN 1 END) as msg_match_count,
+                MAX(from_summary) as matched_summary,
+                GROUP_CONCAT(CASE WHEN message_id IS NOT NULL THEN message_id END) as matched_ids
+            FROM all_matches
+            GROUP BY topic_id
+            ORDER BY msg_match_count DESC, matched_summary DESC
+            LIMIT ?
+        )
+        SELECT
+            site.name as site_name,
+            site.url as site_url,
+            s.stream_id,
+            s.name as stream_name,
+            t.id as topic_id,
+            t.name as topic_name,
+            mt.matched_ids,
+            mt.msg_match_count,
+            mt.matched_summary,
+            sum.summary_text,
+            sum.importance,
+            sum.urgency
+        FROM matching_topics mt
+        JOIN topics t ON t.id = mt.topic_id
+        JOIN streams s ON s.id = t.stream_id
+        JOIN sites site ON site.id = s.site_id
+        LEFT JOIN summaries sum ON sum.topic_id = t.id
+        ORDER BY mt.msg_match_count DESC, mt.matched_summary DESC
+    """
+
+    # Query uses the search term twice (messages + summaries) plus params twice
+    cursor = db.execute(matching_query, [query] + params + [query] + params + [limit])
+    topic_rows = list(cursor)
+
+    if not topic_rows:
+        return []
+
+    # Phase 2: Get all messages for matching topics
+    results = []
+    for row in topic_rows:
+        topic_id = row["topic_id"]
+        matched_ids_str = row["matched_ids"]
+        matched_ids = set(int(x) for x in matched_ids_str.split(",")) if matched_ids_str else set()
+
+        # Get all messages in this thread
+        msg_cursor = db.execute(
+            """
+            SELECT
+                message_id,
+                sender_name,
+                sender_email,
+                content_text,
+                content_markdown,
+                timestamp
+            FROM messages
+            WHERE topic_id = ?
+            ORDER BY timestamp ASC
+            """,
+            (topic_id,),
+        )
+
+        messages = []
+        for msg in msg_cursor:
+            messages.append({
+                "id": msg["message_id"],
+                "sender": msg["sender_name"],
+                "sender_email": msg["sender_email"],
+                "content": msg["content_markdown"] or msg["content_text"],
+                "timestamp": msg["timestamp"],
+                "matched": msg["message_id"] in matched_ids,
+            })
+
+        # Build Zulip URL
+        stream_encoded = quote(row["stream_name"], safe="")
+        topic_encoded = quote(row["topic_name"], safe="")
+        url = f"{row['site_url']}/#narrow/stream/{row['stream_id']}-{stream_encoded}/topic/{topic_encoded}"
+
+        results.append({
+            "site": row["site_name"],
+            "site_url": row["site_url"],
+            "stream": row["stream_name"],
+            "stream_id": row["stream_id"],
+            "topic": row["topic_name"],
+            "url": url,
+            "message_count": len(messages),
+            "matched_message_ids": list(matched_ids),
+            "matched_in_summary": bool(row["matched_summary"]),
+            "summary": row["summary_text"],
+            "importance": row["importance"],
+            "urgency": row["urgency"],
+            "messages": messages,
+        })
+
+    return results
+
+
+def rebuild_fts_index() -> Dict[str, int]:
+    """Rebuild FTS indexes from scratch. Returns counts of indexed items."""
+    db = get_database()
+
+    # Rebuild messages FTS
+    db.execute("DROP TABLE IF EXISTS messages_fts")
+    db.execute("""
+        CREATE VIRTUAL TABLE messages_fts USING fts5(
+            content_text,
+            sender_name,
+            content='messages',
+            content_rowid='id'
+        )
+    """)
+    db.execute("""
+        INSERT INTO messages_fts(rowid, content_text, sender_name)
+        SELECT id, content_text, sender_name FROM messages
+    """)
+
+    # Rebuild summaries FTS
+    db.execute("DROP TABLE IF EXISTS summaries_fts")
+    db.execute("""
+        CREATE VIRTUAL TABLE summaries_fts USING fts5(
+            summary_text,
+            key_points,
+            action_items,
+            content='summaries',
+            content_rowid='id'
+        )
+    """)
+    db.execute("""
+        INSERT INTO summaries_fts(rowid, summary_text, key_points, action_items)
+        SELECT id, summary_text, COALESCE(key_points, ''), COALESCE(action_items, '')
+        FROM summaries
+    """)
+
+    db.commit()
+
+    # Return counts
+    msg_count = db.execute("SELECT COUNT(*) as count FROM messages_fts").fetchone()["count"]
+    sum_count = db.execute("SELECT COUNT(*) as count FROM summaries_fts").fetchone()["count"]
+    return {"messages": msg_count, "summaries": sum_count}

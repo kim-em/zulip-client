@@ -6,7 +6,7 @@ import base64
 import json
 import sys
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -121,7 +121,8 @@ class ZulipClient:
             if s.get("is_muted")
         }
 
-        # Build set of muted topics (visibility_policy=1 means muted)
+        # Build set of muted topics
+        # visibility_policy: 1=muted, 2=unmuted, 3=followed
         muted_topics = {
             (t["stream_id"], t["topic_name"])
             for t in response.get("user_topics", [])
@@ -249,11 +250,30 @@ class ZulipClient:
 
         return response.get("topics", [])
 
+    def mark_topic_as_read(self, stream_id: int, topic_name: str) -> bool:
+        """Mark all messages in a topic as read on the server.
+
+        Returns True if successful.
+        """
+        response = self._request(
+            "POST",
+            "/mark_topic_as_read",
+            {
+                "stream_id": stream_id,
+                "topic_name": topic_name,
+            },
+        )
+
+        if response.get("result") != "success":
+            raise RuntimeError(f"Mark topic as read failed: {response.get('msg')}")
+
+        return True
+
     def scan_my_topics(
         self,
         start_anchor: Union[str, int] = "newest",
         stop_at_message_id: Optional[int] = None,
-        needed_callback: Optional[callable] = None,
+        needed_callback: Optional[Callable[[Dict[str, Any]], bool]] = None,
         verbose: bool = False,
     ) -> tuple[List[Dict[str, Any]], Optional[int], bool]:
         """Scan messages to find topics where the current user has participated.
@@ -358,3 +378,89 @@ class ZulipClient:
             oldest_scanned_id,
             reached_end and not stopped_early,
         )
+
+    def get_newest_message_id(self) -> Optional[int]:
+        """Get the ID of the newest message visible to this user.
+
+        Used as a quick check before doing incremental sync.
+        """
+        response = self._request(
+            "GET",
+            "/messages",
+            {
+                "narrow": json.dumps([]),
+                "anchor": "newest",
+                "num_before": "1",
+                "num_after": "0",
+                "apply_markdown": "false",
+            },
+        )
+
+        if response.get("result") != "success":
+            return None
+
+        messages = response.get("messages", [])
+        return messages[0]["id"] if messages else None
+
+    def get_all_messages_after(
+        self,
+        after_message_id: int,
+        verbose: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Get all stream messages after a given ID, paginated.
+
+        Used for incremental sync - fetches all new messages across all streams
+        in a single paginated call instead of per-stream queries.
+
+        Args:
+            after_message_id: Fetch messages with ID > this value
+            verbose: Show progress
+
+        Returns:
+            List of messages (stream messages only, ordered by ID ascending)
+        """
+        all_messages: List[Dict[str, Any]] = []
+        anchor = after_message_id + 1
+        batch_size = 1000
+
+        while True:
+            response = self._request(
+                "GET",
+                "/messages",
+                {
+                    "narrow": json.dumps([]),  # No narrow - get all messages
+                    "anchor": str(anchor),
+                    "num_before": "0",
+                    "num_after": str(batch_size),
+                    "apply_markdown": "false",
+                },
+            )
+
+            if response.get("result") != "success":
+                raise RuntimeError(f"Get messages failed: {response.get('msg')}")
+
+            raw_messages = response.get("messages", [])
+
+            # Filter to only stream messages after our anchor
+            stream_messages = [
+                m for m in raw_messages
+                if m["id"] > after_message_id and m.get("type") == "stream"
+            ]
+
+            all_messages.extend(stream_messages)
+
+            if verbose:
+                sys.stderr.write(f"  Fetched {len(all_messages)} new messages...\r")
+                sys.stderr.flush()
+
+            if response.get("found_newest") or not raw_messages:
+                break
+
+            # Use last raw message ID for anchor (not just stream messages)
+            anchor = raw_messages[-1]["id"]
+
+        if verbose:
+            sys.stderr.write(f"  Fetched {len(all_messages)} new messages.                    \n")
+            sys.stderr.flush()
+
+        return all_messages

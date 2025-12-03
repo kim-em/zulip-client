@@ -82,25 +82,42 @@ def extract_json(text: str) -> Optional[str]:
     return None
 
 
+MAX_MESSAGES = 200  # Limit to avoid prompt length issues
+
+
 def generate_summary(
     messages: List[Dict[str, Any]], model: str = DEFAULT_MODEL
 ) -> Dict[str, Any]:
     """Generate summary using claude -p with JSON schema enforcement.
 
     Returns dict with: summary, importance, urgency, key_points, action_items, participants
+
+    Note: Requires Claude Code CLI (`claude`) to be installed and available in PATH.
+    Install from: https://github.com/anthropics/claude-code
     """
     prompt = get_prompt()
+
+    # Truncate long threads to last MAX_MESSAGES
+    total_messages = len(messages)
+    if total_messages > MAX_MESSAGES:
+        omitted = total_messages - MAX_MESSAGES
+        messages = messages[-MAX_MESSAGES:]
+        truncation_note = f"[Note: Thread has {total_messages} messages. Showing last {MAX_MESSAGES}; {omitted} earlier messages omitted.]\n\n"
+    else:
+        truncation_note = ""
+
     thread_text = format_messages(messages)
-    full_input = f"{prompt}\n{thread_text}"
+    full_input = f"{prompt}\n{truncation_note}{thread_text}"
 
     result = subprocess.run(
         [
-            "claude", "-p", full_input,
+            "claude", "-p",
             "--model", model,
             "--tools", "",  # Disable tools for pure text analysis
             "--output-format", "json",
             "--json-schema", json.dumps(SUMMARY_SCHEMA),
         ],
+        input=full_input,  # Pass prompt via stdin to avoid arg length limits
         capture_output=True,
         text=True,
         timeout=300,  # 5 minute timeout for large threads

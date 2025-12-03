@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List, NoReturn, Optional
+from typing import Dict, List, NoReturn, Optional, Tuple
 
 from .api import ZulipClient
 from .credentials import get_default_site, list_sites
@@ -36,11 +36,19 @@ from .database import (
     topic_has_messages,
     get_sync_mine_state,
     update_sync_mine_state,
+    get_sync_all_state,
+    update_sync_all_state,
+    validate_sync_all_state,
+    get_message_count_for_site,
+    get_max_message_id_for_site,
     get_topic_by_names,
     get_summary,
     save_summary,
     is_summary_stale,
     get_topics_for_triage,
+    mark_topic_as_read,
+    search_threads,
+    rebuild_fts_index,
 )
 from .export import export_topic_to_json, export_topic_to_markdown
 from .summarize import generate_summary, DEFAULT_MODEL
@@ -129,28 +137,17 @@ def cmd_sync(args: argparse.Namespace) -> None:
     do_all = getattr(args, 'sync_all', False)
     do_unread = args.unread
     do_mine = args.mine
+    do_full = getattr(args, 'full', False)
 
-    # If no mode specified, show help
+    # Default to --all if no mode specified
     if not do_all and not do_unread and not do_mine:
-        print("Usage: zulip-client sync [--all | --unread | --mine] [-s SITE] [-v] [-n LIMIT]")
-        print()
-        print("Modes:")
-        print("  --all      Sync everything (all topics from all subscribed streams)")
-        print("  --unread   Sync threads with unread messages")
-        print("  --mine     Sync threads I've participated in")
-        print()
-        print("Options:")
-        print("  -s, --site   Zulip site to sync")
-        print("  -a           Sync all configured sites")
-        print("  -v           Show detailed progress")
-        print("  -n LIMIT     Limit number of topics to sync")
-        return
+        do_all = True
 
     sites = list_sites() if args.all_sites else [args.site or get_default_site()]
 
     for site_name in sites:
         if do_all:
-            _sync_all(site_name, args.verbose, args.limit)
+            _sync_all(site_name, args.verbose, args.limit, force_full=do_full)
         else:
             if do_unread:
                 _sync_unread(site_name, args.verbose, args.limit)
@@ -162,12 +159,41 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print()
 
 
-def _sync_all(site_name: str, verbose: bool, limit: Optional[int] = None) -> None:
-    """Sync all topics from all subscribed streams."""
+def _sync_all(site_name: str, verbose: bool, limit: Optional[int] = None, force_full: bool = False) -> None:
+    """Sync all topics from all subscribed streams.
+
+    Uses incremental mode when possible:
+    - If we have a valid sync state (high water mark + message count), fetch only new messages
+    - Otherwise (or if --full), do a full stream-by-stream sync
+    """
     client = ZulipClient(site_name)
 
     print(f"Syncing all from {client.site_url}...", flush=True)
 
+    # Check for incremental mode FIRST (before expensive register() call)
+    site_id = get_site_id(site_name)
+    if site_id and not force_full and not limit:
+        sync_state = get_sync_all_state(site_id)
+        if sync_state and validate_sync_all_state(site_id):
+            # Fast incremental mode - skip register() entirely
+            total_new = _sync_all_incremental(
+                client, site_id, sync_state["last_synced_message_id"], verbose
+            )
+            update_site_last_sync(site_id)
+
+            # Update sync state with new high water mark
+            new_max_id = get_max_message_id_for_site(site_id)
+            if new_max_id:
+                new_count = get_message_count_for_site(site_id, new_max_id)
+                update_sync_all_state(site_id, new_max_id, new_count)
+
+            print(f"Incremental sync complete. {total_new} new messages.", flush=True)
+            return
+        elif sync_state:
+            # Validation failed - warn and fall through to full sync
+            print("Warning: Message count mismatch detected. Performing full resync.", flush=True)
+
+    # Full sync mode - need register() for subscriptions and unread state
     data = client.register()
     subscriptions = data["subscriptions"]
 
@@ -178,16 +204,17 @@ def _sync_all(site_name: str, verbose: bool, limit: Optional[int] = None) -> Non
         print("No subscribed streams found.")
         return
 
-    print(f"Found {len(streams)} subscribed streams.", flush=True)
-
-    # Store site
+    # Store site (may already exist)
     site_id = get_or_create_site(site_name, client.site_url)
 
-    # Also update unread state while we're at it
+    # Update unread state
     unread_msgs = data["unread_msgs"]
     stream_map = {sub["stream_id"]: sub["name"] for sub in subscriptions}
     clear_unread_messages(site_id)
     insert_unread_messages(site_id, unread_msgs.get("streams", []), stream_map)
+
+    # Full sync mode
+    print(f"Found {len(streams)} subscribed streams.", flush=True)
 
     total_new_messages = 0
     topics_synced = 0
@@ -265,8 +292,171 @@ def _sync_all(site_name: str, verbose: bool, limit: Optional[int] = None) -> Non
 
     update_site_last_sync(site_id)
 
+    # Update sync state for future incremental syncs
+    max_id = get_max_message_id_for_site(site_id)
+    if max_id:
+        count = get_message_count_for_site(site_id, max_id)
+        update_sync_all_state(site_id, max_id, count)
+        if verbose:
+            print(f"Sync state saved: message_id={max_id}, count={count}", flush=True)
+
     print(flush=True)
     print(f"Full sync complete. {total_new_messages} new messages from {topics_synced} topics.", flush=True)
+
+
+def _sync_all_incremental(
+    client: ZulipClient,
+    site_id: int,
+    after_message_id: int,
+    verbose: bool,
+) -> int:
+    """Incremental sync: fetch all new messages across all streams in one call.
+
+    Returns count of new messages inserted.
+    """
+    # Quick check: is there anything new at all?
+    newest_id = client.get_newest_message_id()
+    if newest_id is None or newest_id <= after_message_id:
+        if verbose:
+            print("No new messages.", flush=True)
+        return 0
+
+    if verbose:
+        print(f"Incremental sync from message ID {after_message_id}...", flush=True)
+
+    # Fetch all new stream messages in one paginated call
+    messages = client.get_all_messages_after(after_message_id, verbose=verbose)
+
+    if not messages:
+        return 0
+
+    # Group messages by stream/topic for insertion
+    # Each message has: stream_id, display_recipient (stream name), subject (topic name)
+    by_topic: Dict[Tuple[int, str, str], List[Dict]] = {}
+    for msg in messages:
+        if msg.get("type") != "stream":
+            continue
+        key = (msg["stream_id"], msg["display_recipient"], msg["subject"])
+        if key not in by_topic:
+            by_topic[key] = []
+        by_topic[key].append(msg)
+
+    total_inserted = 0
+
+    for (stream_id, stream_name, topic_name), topic_messages in by_topic.items():
+        # Get or create stream and topic
+        stream_db_id = get_or_create_stream(site_id, stream_id, stream_name)
+        topic_db_id = get_or_create_topic(stream_db_id, topic_name)
+
+        # Insert messages
+        inserted = insert_messages(topic_db_id, topic_messages)
+        total_inserted += inserted
+
+        # Update topic's last_message_id
+        max_msg_id = max(m["id"] for m in topic_messages)
+        current_last = get_topic_last_message_id(topic_db_id)
+        if current_last is None or max_msg_id > current_last:
+            update_topic_last_message_id(topic_db_id, max_msg_id)
+
+        if verbose and inserted > 0:
+            print(f"  #{stream_name} > {topic_name}: {inserted} new", flush=True)
+
+    return total_inserted
+
+
+def _sync_topics(
+    client: ZulipClient,
+    site_id: int,
+    site_name: str,
+    topics: List[Dict],
+    *,
+    incremental: bool = True,
+    export_json: bool = False,
+    unread_ids_by_topic: Optional[Dict[str, List[int]]] = None,
+    verbose: bool = False,
+) -> Tuple[int, int]:
+    """Sync a list of topics from Zulip to the database.
+
+    Args:
+        client: ZulipClient instance
+        site_id: Database site ID
+        site_name: Site name for export paths
+        topics: List of topic dicts with stream_id, stream_name, topic_name
+        incremental: If True, only fetch messages after last_message_id
+        export_json: If True, export synced topics to JSON
+        unread_ids_by_topic: Dict mapping "stream:topic" to unread message IDs (for export)
+        verbose: Show progress output
+
+    Returns:
+        (topics_synced, total_new_messages)
+    """
+    total_new_messages = 0
+    topics_synced = 0
+
+    for topic in topics:
+        stream_name = topic["stream_name"]
+        topic_name = topic["topic_name"]
+        topics_synced += 1
+
+        # Get or create stream and topic in database
+        stream_db_id = get_or_create_stream(site_id, topic["stream_id"], stream_name)
+        topic_db_id = get_or_create_topic(stream_db_id, topic_name)
+
+        # Get the last message ID for incremental sync
+        last_message_id = get_topic_last_message_id(topic_db_id) if incremental else None
+
+        # Short-circuit for incremental sync: skip if already up to date
+        if incremental and last_message_id:
+            # Check if we have unread IDs to compare against
+            message_ids = topic.get("message_ids", [])
+            if message_ids:
+                max_unread_id = max(message_ids)
+                if max_unread_id <= last_message_id:
+                    if verbose:
+                        print(f"[{topics_synced}/{len(topics)}] #{stream_name} > {topic_name}... up to date", flush=True)
+                    continue
+
+        if verbose:
+            print(f"[{topics_synced}/{len(topics)}] #{stream_name} > {topic_name}...", flush=True)
+
+        # Fetch messages from Zulip
+        messages = client.get_topic_messages(
+            stream_name,
+            topic_name,
+            after_message_id=last_message_id,
+            verbose=verbose,
+        )
+
+        if messages:
+            # Insert messages into database
+            inserted = insert_messages(topic_db_id, messages)
+            total_new_messages += inserted
+
+            # Update last message ID
+            max_message_id = max(m["id"] for m in messages)
+            update_topic_last_message_id(topic_db_id, max_message_id)
+
+            if verbose:
+                print(f"  Stored {inserted} new messages ({len(messages)} fetched)", flush=True)
+
+            # Export to JSON if requested
+            if export_json:
+                all_stored_messages = get_topic_messages(site_id, stream_name, topic_name)
+                key = f"{stream_name}:{topic_name}"
+                unread_ids = unread_ids_by_topic.get(key, []) if unread_ids_by_topic else []
+                export_path = export_topic_to_json(
+                    site_name,
+                    stream_name,
+                    topic_name,
+                    all_stored_messages,
+                    unread_ids,
+                )
+                if verbose:
+                    print(f"  Exported to {export_path}", flush=True)
+        elif verbose:
+            print("  No new messages", flush=True)
+
+    return topics_synced, total_new_messages
 
 
 def _sync_unread(site_name: str, verbose: bool, limit: Optional[int] = None) -> None:
@@ -304,65 +494,22 @@ def _sync_unread(site_name: str, verbose: bool, limit: Optional[int] = None) -> 
         print(f"Found {len(unread_topics)} topics with unread messages.", flush=True)
     print(flush=True)
 
-    total_new_messages = 0
-    topics_synced = 0
+    # Build unread IDs lookup for export
+    unread_ids_by_topic = {
+        f"{t['stream_name']}:{t['topic_name']}": t["message_ids"]
+        for t in unread_topics
+    }
 
-    for topic in unread_topics:
-        stream_name = topic["stream_name"]
-        topic_name = topic["topic_name"]
-        topics_synced += 1
-
-        # Get or create stream and topic in database
-        stream_db_id = get_or_create_stream(site_id, topic["stream_id"], stream_name)
-        topic_db_id = get_or_create_topic(stream_db_id, topic_name)
-
-        # Get the last message ID we have for incremental sync
-        last_message_id = get_topic_last_message_id(topic_db_id)
-
-        # Short-circuit: if we already have all unread messages, skip API call
-        max_unread_id = max(topic["message_ids"]) if topic["message_ids"] else 0
-        if last_message_id and max_unread_id <= last_message_id:
-            if verbose:
-                print(f"[{topics_synced}/{len(unread_topics)}] #{stream_name} > {topic_name}... up to date", flush=True)
-            continue
-
-        if verbose:
-            print(f"[{topics_synced}/{len(unread_topics)}] #{stream_name} > {topic_name}...", flush=True)
-
-        # Fetch messages from Zulip
-        messages = client.get_topic_messages(
-            stream_name,
-            topic_name,
-            after_message_id=last_message_id,
-            verbose=verbose,
-        )
-
-        if messages:
-            # Insert messages into database
-            inserted = insert_messages(topic_db_id, messages)
-            total_new_messages += inserted
-
-            # Update last message ID
-            max_message_id = max(m["id"] for m in messages)
-            update_topic_last_message_id(topic_db_id, max_message_id)
-
-            if verbose:
-                print(f"  Stored {inserted} new messages ({len(messages)} fetched)", flush=True)
-
-            # Export to JSON
-            all_stored_messages = get_topic_messages(site_id, stream_name, topic_name)
-            export_path = export_topic_to_json(
-                site_name,
-                stream_name,
-                topic_name,
-                all_stored_messages,
-                topic["message_ids"],
-            )
-
-            if verbose:
-                print(f"  Exported to {export_path}", flush=True)
-        elif verbose:
-            print("  No new messages", flush=True)
+    topics_synced, total_new_messages = _sync_topics(
+        client,
+        site_id,
+        site_name,
+        unread_topics,
+        incremental=True,
+        export_json=True,
+        unread_ids_by_topic=unread_ids_by_topic,
+        verbose=verbose,
+    )
 
     update_site_last_sync(site_id)
 
@@ -427,42 +574,15 @@ def _sync_mine(site_name: str, verbose: bool, limit: Optional[int] = None) -> No
     print(f"Found {len(topics_to_sync)} topics to sync.", flush=True)
     print(flush=True)
 
-    total_new_messages = 0
-    topics_synced = 0
-
-    for topic in topics_to_sync:
-        stream_name = topic["stream_name"]
-        topic_name = topic["topic_name"]
-        topics_synced += 1
-
-        if verbose:
-            print(f"[{topics_synced}/{len(topics_to_sync)}] #{stream_name} > {topic_name}...", flush=True)
-
-        # Get or create stream and topic in database
-        stream_db_id = get_or_create_stream(site_id, topic["stream_id"], stream_name)
-        topic_db_id = get_or_create_topic(stream_db_id, topic_name)
-
-        # Fetch all messages (no incremental since it's a new topic)
-        messages = client.get_topic_messages(
-            stream_name,
-            topic_name,
-            after_message_id=None,
-            verbose=verbose,
-        )
-
-        if messages:
-            # Insert messages into database
-            inserted = insert_messages(topic_db_id, messages)
-            total_new_messages += inserted
-
-            # Update last message ID
-            max_message_id = max(m["id"] for m in messages)
-            update_topic_last_message_id(topic_db_id, max_message_id)
-
-            if verbose:
-                print(f"  Stored {inserted} messages", flush=True)
-        elif verbose:
-            print("  No messages found", flush=True)
+    topics_synced, total_new_messages = _sync_topics(
+        client,
+        site_id,
+        site_name,
+        topics_to_sync,
+        incremental=False,  # Fetch all messages for new topics
+        export_json=False,
+        verbose=verbose,
+    )
 
     update_site_last_sync(site_id)
 
@@ -693,7 +813,7 @@ def _summary_single(
     site_id: int,
     stream_name: str,
     topic_name: str,
-    model: str,
+    explicit_model: Optional[str],
     force: bool,
     no_generate: bool,
 ) -> bool:
@@ -727,6 +847,19 @@ def _summary_single(
             print(f"No summary cached for #{stream_name} > {topic_name}")
         return True
 
+    # Check quota before generating (unless --model explicitly set)
+    if explicit_model:
+        model = explicit_model
+    else:
+        model = _get_available_model()
+        if model is None:
+            print("Quota exhausted. Use --model to override.", file=sys.stderr)
+            if existing:
+                print()
+                print("Showing cached summary:")
+                _display_summary(stream_name, topic_name, existing, topic_last_msg)
+            return False
+
     # Generate new summary
     messages = get_topic_messages(site_id, stream_name, topic_name)
     if not messages:
@@ -743,7 +876,7 @@ def _summary_single(
     print()
 
     try:
-        result = generate_summary(messages, model=model or DEFAULT_MODEL)
+        result = generate_summary(messages, model=model)
     except Exception as e:
         print(f"Error generating summary: {e}", file=sys.stderr)
         if existing:
@@ -800,6 +933,9 @@ def _summary_channel(site_id: int, stream_name: str, args: argparse.Namespace) -
         print(f"All {len(topics)} topics in #{stream_name} already have summaries.")
         return
 
+    # Sort by most recent first (higher last_message_id = more recent)
+    to_process.sort(key=lambda x: x[2]["last_message_id"], reverse=True)
+
     _generate_batch(site_id, to_process, args)
 
 
@@ -834,6 +970,9 @@ def _summary_all(site_id: int, args: argparse.Namespace) -> None:
         total = sum(ch["topic_count"] for ch in channels)
         print(f"All {total} downloaded topics already have summaries.")
         return
+
+    # Sort by most recent first (higher last_message_id = more recent)
+    to_process.sort(key=lambda x: x[2]["last_message_id"], reverse=True)
 
     _generate_batch(site_id, to_process, args)
 
@@ -1020,12 +1159,19 @@ def cmd_triage(args: argparse.Namespace) -> None:
     print(f"Triage: {len(filtered)} {scope} ({total_with_summary} summarized)")
     print("=" * 70)
 
+    def _build_topic_url(t: Dict) -> str:
+        from urllib.parse import quote
+        stream_name_encoded = quote(t["stream_name"], safe="")
+        topic_name_encoded = quote(t["topic_name"], safe="")
+        return f"{t['site_url']}/#narrow/stream/{t['stream_id']}-{stream_name_encoded}/topic/{topic_name_encoded}"
+
     def _print_topic_line(t: Dict) -> None:
         unread = f" [{t['unread_count']} unread]" if t["unread_count"] > 0 else ""
         stale = ""
         if t["summary_last_msg"] and t["topic_last_msg"] and t["summary_last_msg"] != t["topic_last_msg"]:
             stale = " [stale]"
         print(f"#{t['stream_name']} > {t['topic_name']}{unread}{stale}")
+        print(f"  {_build_topic_url(t)}")
         if t["summary_text"]:
             # Truncate summary to first sentence or 100 chars
             summary = t["summary_text"]
@@ -1066,14 +1212,90 @@ def cmd_triage(args: argparse.Namespace) -> None:
         print(f"NOT YET SUMMARIZED ({len(no_summary)})")
         print("-" * 40)
         for t in no_summary:
-            unread = f" [{t['unread_count']} unread]" if t["unread_count"] > 0 else ""
-            print(f"#{t['stream_name']} > {t['topic_name']}{unread}")
+            _print_topic_line(t)
 
     # Summary counts
     hidden_low = len(low) if importance_filter and importance_filter != "low" else 0
     if hidden_low > 0:
         print()
         print(f"[{hidden_low} low-importance threads hidden]")
+
+
+def cmd_mark_as_read(args: argparse.Namespace) -> None:
+    """Mark a topic as read (on Zulip server and locally)."""
+    site_name = args.site or get_default_site()
+    stream_name = getattr(args, 'stream', None)
+    topic_name = getattr(args, 'topic', None)
+    importance_filter = getattr(args, 'importance', None)
+    urgency_filter = getattr(args, 'urgency', None)
+
+    site_id = get_site_id(site_name)
+    if site_id is None:
+        print(f"No data found for site '{site_name}'. Run 'sync' first.", file=sys.stderr)
+        sys.exit(1)
+
+    client = ZulipClient(site_name)
+
+    def _mark_single_topic(stream_name: str, topic_name: str, stream_id: int) -> int:
+        """Mark a single topic as read on server and locally. Returns local count."""
+        # Mark on Zulip server
+        client.mark_topic_as_read(stream_id, topic_name)
+        # Update local database
+        return mark_topic_as_read(site_id, stream_name, topic_name)
+
+    # If stream/topic provided, mark that specific topic
+    if stream_name and topic_name:
+        stream = get_stream_by_name(site_id, stream_name)
+        if stream is None:
+            print(f"Stream not found: #{stream_name}", file=sys.stderr)
+            sys.exit(1)
+
+        _mark_single_topic(stream_name, topic_name, stream["stream_id"])
+        print(f"Marked as read: #{stream_name} > {topic_name}")
+        return
+
+    # Otherwise, use importance/urgency filters
+    if not importance_filter and not urgency_filter:
+        print("Either stream/topic or --importance/--urgency filter required.", file=sys.stderr)
+        sys.exit(1)
+
+    # Get all unread topics with summaries
+    topics = get_topics_for_triage(site_id, unread_only=True)
+
+    importance_order = {"high": 3, "medium": 2, "low": 1}
+    urgency_order = {"high": 3, "medium": 2, "low": 1}
+
+    # Filter to topics matching criteria (must have summary)
+    matching = []
+    for t in topics:
+        imp = t["importance"]
+        urg = t["urgency"]
+
+        # Skip topics without summaries
+        if imp is None:
+            continue
+
+        # Filter by importance (at or below threshold)
+        if importance_filter:
+            if importance_order.get(imp, 0) > importance_order.get(importance_filter, 0):
+                continue
+
+        # Filter by urgency (at or below threshold)
+        if urgency_filter:
+            if urgency_order.get(urg, 0) > urgency_order.get(urgency_filter, 0):
+                continue
+
+        matching.append(t)
+
+    if not matching:
+        print("No matching unread topics found.")
+        return
+
+    for t in matching:
+        _mark_single_topic(t["stream_name"], t["topic_name"], t["stream_id"])
+        print(f"Marked as read: #{t['stream_name']} > {t['topic_name']}")
+
+    print(f"\nTotal: {len(matching)} topics marked as read.")
 
 
 def _display_summary(
@@ -1155,6 +1377,93 @@ def _display_summary(
             print()
 
 
+def cmd_search(args: argparse.Namespace) -> None:
+    """Full-text search across messages."""
+    import json as json_module
+    from datetime import datetime
+
+    site_name = args.site or get_default_site()
+    query = args.query
+    stream_filter = getattr(args, 'stream', None)
+    limit = args.limit or 10
+    json_output = args.json
+
+    site_id = get_site_id(site_name)
+    if site_id is None:
+        print(f"No data found for site '{site_name}'. Run 'sync' first.", file=sys.stderr)
+        sys.exit(1)
+
+    results = search_threads(
+        query=query,
+        site_id=site_id,
+        stream_name=stream_filter,
+        limit=limit,
+    )
+
+    if not results:
+        if json_output:
+            print(json_module.dumps({"threads": [], "query": query}))
+        else:
+            print(f"No results for: {query}")
+        return
+
+    if json_output:
+        # JSON output for RAG/Claude Code consumption
+        output = {
+            "query": query,
+            "site": site_name,
+            "thread_count": len(results),
+            "threads": results,
+        }
+        print(json_module.dumps(output, indent=2))
+    else:
+        # Human-readable output
+        print(f"Search: {query}")
+        print(f"Found {len(results)} threads")
+        print("=" * 70)
+
+        for thread in results:
+            print()
+            unread_note = ""
+            if thread.get("importance"):
+                unread_note = f" [{thread['importance']}/{thread['urgency']}]"
+            print(f"#{thread['stream']} > {thread['topic']}{unread_note}")
+            print(f"  {thread['url']}")
+
+            # Show match info
+            msg_matches = len(thread['matched_message_ids'])
+            summary_match = thread.get('matched_in_summary', False)
+            if msg_matches and summary_match:
+                print(f"  {thread['message_count']} messages, {msg_matches} matched + summary matched")
+            elif summary_match:
+                print(f"  {thread['message_count']} messages, matched in summary")
+            else:
+                print(f"  {thread['message_count']} messages, {msg_matches} matched")
+
+            if thread.get("summary"):
+                summary = thread["summary"]
+                if len(summary) > 100:
+                    summary = summary[:97] + "..."
+                prefix = ">>> " if summary_match else ""
+                print(f"  {prefix}{summary}")
+
+            # Show a snippet of matched messages
+            matched_msgs = [m for m in thread["messages"] if m["matched"]]
+            for msg in matched_msgs[:2]:  # Show first 2 matches
+                ts = datetime.fromtimestamp(msg["timestamp"]).strftime("%Y-%m-%d")
+                content = msg["content"][:80].replace("\n", " ")
+                if len(msg["content"]) > 80:
+                    content += "..."
+                print(f"    [{ts}] {msg['sender']}: {content}")
+
+
+def cmd_rebuild_fts(args: argparse.Namespace) -> None:
+    """Rebuild FTS index from scratch."""
+    print("Rebuilding full-text search indexes...")
+    counts = rebuild_fts_index()
+    print(f"Indexed {counts['messages']} messages and {counts['summaries']} summaries.")
+
+
 def cmd_sites(args: argparse.Namespace) -> None:
     """List configured Zulip sites."""
     sites = list_sites()
@@ -1183,14 +1492,15 @@ def main() -> NoReturn:
     unread_parser.set_defaults(func=cmd_unread)
 
     # sync command
-    sync_parser = subparsers.add_parser("sync", help="Download threads (specify --all, --unread, or --mine)")
+    sync_parser = subparsers.add_parser("sync", help="Download messages (default: all subscribed streams)")
     sync_parser.add_argument("-s", "--site", help="Zulip site")
     sync_parser.add_argument("-a", dest="all_sites", action="store_true", help="Sync all configured sites")
     sync_parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed progress")
     sync_parser.add_argument("-n", "--limit", type=int, help="Limit number of topics to sync")
-    sync_parser.add_argument("--all", dest="sync_all", action="store_true", help="Sync everything (unread + mine)")
+    sync_parser.add_argument("--all", dest="sync_all", action="store_true", help="Sync all subscribed streams (default)")
     sync_parser.add_argument("--unread", action="store_true", help="Sync threads with unread messages")
     sync_parser.add_argument("--mine", action="store_true", help="Sync threads I've participated in")
+    sync_parser.add_argument("--full", action="store_true", help="Force full resync (skip incremental mode)")
     sync_parser.set_defaults(func=cmd_sync)
 
     # export command
@@ -1247,6 +1557,30 @@ def main() -> NoReturn:
     triage_parser.add_argument("--model", help=f"Claude model (default: {DEFAULT_MODEL}). If specified, skips quota checking.")
     triage_parser.add_argument("-n", "--limit", type=int, help="Limit number of summaries to generate")
     triage_parser.set_defaults(func=cmd_triage)
+
+    # mark-as-read command
+    mark_read_parser = subparsers.add_parser("mark-as-read", help="Mark topics as read")
+    mark_read_parser.add_argument("stream", nargs="?", help="Channel/stream name")
+    mark_read_parser.add_argument("topic", nargs="?", help="Topic name")
+    mark_read_parser.add_argument("-s", "--site", help="Zulip site")
+    mark_read_parser.add_argument("--importance", choices=["high", "medium", "low"],
+                                  help="Mark all topics at or below this importance level")
+    mark_read_parser.add_argument("--urgency", choices=["high", "medium", "low"],
+                                  help="Mark all topics at or below this urgency level")
+    mark_read_parser.set_defaults(func=cmd_mark_as_read)
+
+    # search command
+    search_parser = subparsers.add_parser("search", help="Full-text search across messages")
+    search_parser.add_argument("query", help="Search query (supports AND, OR, NOT, phrases, prefix*)")
+    search_parser.add_argument("-s", "--site", help="Zulip site")
+    search_parser.add_argument("--stream", help="Limit search to specific stream")
+    search_parser.add_argument("-n", "--limit", type=int, default=10, help="Max threads to return (default: 10)")
+    search_parser.add_argument("--json", action="store_true", help="Output as JSON (for Claude Code/RAG)")
+    search_parser.set_defaults(func=cmd_search)
+
+    # rebuild-fts command
+    rebuild_fts_parser = subparsers.add_parser("rebuild-fts", help="Rebuild full-text search index")
+    rebuild_fts_parser.set_defaults(func=cmd_rebuild_fts)
 
     args = parser.parse_args()
 
