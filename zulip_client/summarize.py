@@ -114,7 +114,7 @@ def generate_summary(
             "claude", "-p",
             "--model", model,
             "--tools", "",  # Disable built-in tools
-            "--mcp-config", "{}", "--strict-mcp-config",  # Disable all MCP servers
+            "--strict-mcp-config",  # Ignore user's MCP server config
             "--output-format", "json",
             "--json-schema", json.dumps(SUMMARY_SCHEMA),
         ],
